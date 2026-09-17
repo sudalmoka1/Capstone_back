@@ -1,17 +1,20 @@
 """
-FastAPI 라우터 - 증권 뉴스 크롤링 API
+FastAPI 라우터 - 증권 뉴스 크롤링 및 DB 조회 API
 """
 
+import json
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
+from sqlalchemy import select
 
+from api.storage import ArticleEvaluationModel, ArticleModel, PublisherModel, AsyncSessionLocal
 from crawlers.manager import SecuritiesNewsCrawlerManager
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/news", tags=["뉴스 크롤링"])
+router = APIRouter(prefix="/api", tags=["뉴스 크롤링 및 조회"])
 
 manager = SecuritiesNewsCrawlerManager(max_pages=3)
 
@@ -23,7 +26,7 @@ class ArticleOut(BaseModel):
     source: str
     publisher: str
     published_at: Optional[str]
-    content_preview: str          # 본문 앞 200자
+    content_preview: str
     related_stocks: list[str]
 
 
@@ -33,20 +36,35 @@ class CrawlResult(BaseModel):
     articles: list[ArticleOut]
 
 
+class EvaluationOut(BaseModel):
+    status: str
+    score: int
+    report: Optional[Dict[str, Any]] = None
+
+
+class ArticleDBOut(BaseModel):
+    id: int
+    title: str
+    url: str
+    source: str
+    publisher: str
+    published_at: Optional[str]
+    content: Optional[str]
+    evaluation: Optional[EvaluationOut] = None
+
+    class Config:
+        from_attributes = True
+
+
 # ── 엔드포인트 ────────────────────────────────────────────────
-@router.get("/securities", response_model=CrawlResult)
+
+@router.get("/news/securities", response_model=CrawlResult)
 async def get_securities_news(
     sources: list[str] = Query(default=["naver", "hankyung"]),
     fetch_content: bool = Query(default=True, description="본문 크롤링 여부"),
     limit: int = Query(default=50, le=200),
 ):
-    """
-    전체 증권 뉴스 수집 엔드포인트
-    
-    - sources: naver / hankyung (복수 선택 가능)
-    - fetch_content: false면 제목+메타만 빠르게 수집
-    - limit: 반환할 최대 기사 수
-    """
+    """실시간 증권 뉴스 수집 엔드포인트"""
     articles = await manager.run(sources=sources, fetch_content=fetch_content)
     articles = articles[:limit]
 
@@ -66,3 +84,67 @@ async def get_securities_news(
             for a in articles
         ],
     )
+
+
+@router.get("/articles", response_model=list[ArticleDBOut])
+async def get_db_articles(
+    limit: int = Query(default=50, le=200),
+    source: Optional[str] = Query(default=None, description="네이버금융 / 한국경제 필터")
+):
+    """
+    DB에 적재된 기사, 언론사 정보(Publisher), LLM 평가 결과를 함께 조회
+    """
+    async with AsyncSessionLocal() as session:
+        # 💡 [핵심] ArticleModel + ArticleEvaluationModel + PublisherModel 3개 테이블 조인
+        stmt = (
+            select(ArticleModel, ArticleEvaluationModel, PublisherModel.name)
+            .outerjoin(ArticleEvaluationModel, ArticleModel.id == ArticleEvaluationModel.article_id)
+            .outerjoin(PublisherModel, ArticleModel.publisher_id == PublisherModel.id)
+            .order_by(ArticleModel.id.desc())
+            .limit(limit)
+        )
+        
+        if source and source != "전체":
+            stmt = stmt.where(ArticleModel.source == source)
+
+        result = await session.execute(stmt)
+        rows = result.all()  # (ArticleModel, ArticleEvaluationModel, publisher_name) 튜플 반환
+
+        output = []
+        for article, evaluation, pub_name in rows:
+            eval_data = None
+            if evaluation:
+                parsed_report = None
+                if evaluation.report:
+                    try:
+                        parsed_report = (
+                            json.loads(evaluation.report)
+                            if isinstance(evaluation.report, str)
+                            else evaluation.report
+                        )
+                    except Exception:
+                        parsed_report = {"summary": str(evaluation.report)}
+
+                eval_data = EvaluationOut(
+                    status=evaluation.status,
+                    score=evaluation.score or 0,
+                    report=parsed_report
+                )
+
+            # 💡 조인으로 추출한 언론사 이름 매핑 (없으면 source 이름 적용)
+            publisher_display = pub_name or article.source or "언론사 미지정"
+
+            output.append(
+                ArticleDBOut(
+                    id=article.id,
+                    title=article.title,
+                    url=article.url,
+                    source=article.source,
+                    publisher=publisher_display,
+                    published_at=article.published_at.isoformat() if article.published_at else None,
+                    content=article.content,
+                    evaluation=eval_data
+                )
+            )
+
+        return output
