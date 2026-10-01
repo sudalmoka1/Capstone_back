@@ -89,6 +89,7 @@ async def get_securities_news(
 @router.get("/articles", response_model=list[ArticleDBOut])
 async def get_db_articles(
     limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0, description="건너뛸 기사 수 (페이지네이션)"),
     source: Optional[str] = Query(default=None, description="네이버금융 / 한국경제 필터")
 ):
     """
@@ -101,11 +102,12 @@ async def get_db_articles(
             .outerjoin(ArticleEvaluationModel, ArticleModel.id == ArticleEvaluationModel.article_id)
             .outerjoin(PublisherModel, ArticleModel.publisher_id == PublisherModel.id)
             .order_by(ArticleModel.id.desc())
-            .limit(limit)
         )
-        
+
         if source and source != "전체":
             stmt = stmt.where(ArticleModel.source == source)
+
+        stmt = stmt.limit(limit).offset(offset)
 
         result = await session.execute(stmt)
         rows = result.all()  # (ArticleModel, ArticleEvaluationModel, publisher_name) 튜플 반환

@@ -42,13 +42,14 @@ class SecuritiesNewsCrawlerManager:
                 continue
             merged.extend(res)
 
-        # 💡 (출처, URL) 조합으로 중복 체크하여 두 출처 기사 모두 보존
-        seen: set[tuple[str, str]] = set()
+        # DB는 url이 unique라 같은 URL을 두 출처로 저장하면 서로 덮어쓴다.
+        # URL 기준으로 한 건만 남기되, 한국경제(015) 기사는 한국경제 출처를 우선한다.
+        merged.sort(key=lambda a: a.source != "한국경제")
+        seen: set[str] = set()
         unique: list[NewsArticle] = []
         for a in merged:
-            key = (a.source, a.url)
-            if key not in seen:
-                seen.add(key)
+            if a.url not in seen:
+                seen.add(a.url)
                 unique.append(a)
 
         unique.sort(key=lambda a: a.published_at or datetime.min, reverse=True)
