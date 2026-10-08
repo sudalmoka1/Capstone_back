@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 크롤링 결과 (원문 데이터는 저장소에 올리지 않음)
+crawl_result.json

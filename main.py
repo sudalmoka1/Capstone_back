@@ -1,9 +1,9 @@
 """
 main.py
 
-[서버 실행]    uvicorn main:app --reload
-[단독 테스트]  python main.py
-[자동 스케줄]  python scheduler.py --interval 30
+[서버 실행]    uvicorn main:app --reload  (또는 python main.py)
+[단독 테스트]  python main.py test
+[자동 스케줄]  python scheduler.py --interval 60  (크롤링 + LLM 분석, 별도 터미널)
 """
 
 import asyncio
@@ -49,10 +49,6 @@ app.include_router(router)
 async def health():
     return {"status": "ok"}
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
 # ── 단독 테스트 (1회 실행) ────────────────────────────────────
 async def _test():
     from collections import Counter
@@ -70,10 +66,10 @@ async def _test():
     print("[테스트] 크롤러 매니저 가동...")
     articles = await manager.run(fetch_content=True)
 
-    # 💡 기사 객체의 a.source ("네이버금융", "한국경제") 기준으로 집계
-    stats = Counter(a.source for a in articles)
-    
-    print(f"\n소스별 수집 현황:")
+    # 언론사(publisher) 기준으로 집계
+    stats = Counter(a.publisher for a in articles)
+
+    print(f"\n언론사별 수집 현황:")
     for src, cnt in stats.items():
         print(f"   {src}: {cnt}건")
     print(f"   합계: {len(articles)}건\n")

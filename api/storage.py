@@ -2,7 +2,7 @@ import os
 import logging
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, Text, DateTime, ForeignKey, select
+from sqlalchemy import String, Text, DateTime, ForeignKey, Integer, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -71,6 +71,7 @@ class StockModel(Base):
 
     stock_code: Mapped[str] = mapped_column(String(20), primary_key=True)
     stock_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    market: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # KOSPI / KOSDAQ
 
 
 # 4. 기사-주식 다대다 매핑 모델
@@ -79,6 +80,7 @@ class ArticleStockModel(Base):
 
     article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
     stock_code: Mapped[str] = mapped_column(ForeignKey("stocks.stock_code", ondelete="CASCADE"), primary_key=True)
+    rank: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # 0 = 대표 종목, 1, 2 ... 순
 
 
 # 데이터베이스 초기화 함수 (main.py의 lifespan에서 호출됨)
@@ -86,9 +88,21 @@ async def init_db():
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # create_all은 기존 테이블에 컬럼을 추가하지 않으므로 market 컬럼을 직접 보강
+            await conn.execute(text("ALTER TABLE stocks ADD COLUMN IF NOT EXISTS market VARCHAR(10)"))
+            await conn.execute(text("ALTER TABLE article_stocks ADD COLUMN IF NOT EXISTS rank INTEGER NOT NULL DEFAULT 0"))
         logger.info("PostgreSQL 테이블 모델 연결 성공")
     except Exception as e:
         logger.error("PostgreSQL 초기화 실패: %s", e)
+
+
+async def get_existing_urls(urls: list[str]) -> set[str]:
+    """주어진 URL 중 이미 articles 테이블에 저장된 것만 반환 (본문 재수집 방지용)"""
+    if not urls:
+        return set()
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(select(ArticleModel.url).where(ArticleModel.url.in_(urls)))
+        return {u for (u,) in rows.all()}
 
 
 # ── 💡 핵심 복합 테이블 자동 저장 로직 (Upsert Pipeline) ──
@@ -136,7 +150,8 @@ async def save_articles_to_db(articles) -> None:
 
                 # [단계 3] 주식 종목(Stocks) 및 매핑(Article_Stocks) 저장
                 if hasattr(a, 'related_stocks') and a.related_stocks:
-                    for stock in a.related_stocks:
+                    # related_stocks는 대표 종목이 앞에 오는 순서 → rank로 저장
+                    for rank, stock in enumerate(a.related_stocks):
                         stock_stmt = pg_insert(StockModel).values(
                             stock_code=stock,
                             stock_name=f"종목_{stock}"
@@ -145,8 +160,13 @@ async def save_articles_to_db(articles) -> None:
 
                         link_stmt = pg_insert(ArticleStockModel).values(
                             article_id=current_art_id,
-                            stock_code=stock
-                        ).on_conflict_do_nothing(index_elements=['article_id', 'stock_code'])
+                            stock_code=stock,
+                            rank=rank
+                        )
+                        link_stmt = link_stmt.on_conflict_do_update(
+                            index_elements=['article_id', 'stock_code'],
+                            set_={'rank': link_stmt.excluded.rank}
+                        )
                         await session.execute(link_stmt)
 
             # 루프가 정상 종료되면 한 번에 커밋
