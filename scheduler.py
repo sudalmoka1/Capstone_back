@@ -4,6 +4,7 @@ scheduler.py — 자동 크롤링 및 LLM 분석 스케줄러
 크롤링과 분석을 서로 다른 루프로 동시에 돌립니다.
 - 크롤링 루프: 외부 사이트 요청이므로 --interval 분마다 한 번 (기본 60분)
 - 분석 루프:   로컬 LLM이므로 대기 기사가 있는 동안 계속 분석, 없으면 --idle 분 쉬고 다시 확인 (기본 5분)
+- 주가 반응:   분석 끝난 기사의 발행 후 1일/5일 수익률을 60분마다 갱신 (price_reaction.py)
 
 [실행]      python scheduler.py
 [간격 지정]  python scheduler.py --interval 60 --idle 5
@@ -29,8 +30,10 @@ from api.storage import (
     AsyncSessionLocal,
     StockModel,
     init_db,
+    update_scheduler_status,
 )
 from crawlers.manager import SecuritiesNewsCrawlerManager
+from price_reaction import update_price_reactions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +45,8 @@ logger = logging.getLogger(__name__)
 analyzer = LLMAnalyzer(model_name="qwen2.5:7b")
 
 BATCH_SIZE = 50  # 분석 1배치에서 처리할 최대 기사 수
+REACTION_INTERVAL_MINUTES = 60  # 기사 후 주가 반응(1일/5일 수익률) 갱신 주기
+HEARTBEAT_SECONDS = 60  # 프론트 '가동 중' 표시용 생존 신호 주기 (API는 3분 넘게 끊기면 중지로 판단)
 
 
 def to_ticker(stock_code, market) -> str | None:
@@ -60,6 +65,7 @@ async def crawl_job(manager: SecuritiesNewsCrawlerManager) -> int:
 
     # 본문까지 수집해야 LLM이 분석 가능하므로 fetch_content=True로 설정
     articles = await manager.run(fetch_content=True)
+    await update_scheduler_status(crawled=True)
 
     logger.info("===== 크롤링 완료 =====")
     return len(articles)
@@ -116,7 +122,7 @@ async def analyze_job(batch_size: int = BATCH_SIZE) -> tuple[int, int]:
             logger.info(f"[{idx}/{total_count}] 기사 ID {article.id} (종목: {stock_disp}) 분석 시작...")
 
             try:
-                report = await asyncio.to_thread(analyzer.analyze, ticker, article.content, stock_name)
+                report = await asyncio.to_thread(analyzer.analyze, ticker, article.content, stock_name, article.title)
 
                 if "error" not in report:
                     values = dict(
@@ -149,11 +155,23 @@ async def analyze_job(batch_size: int = BATCH_SIZE) -> tuple[int, int]:
                 await session.rollback()
                 logger.error(f"기사 ID {article.id} 저장 중 오류: {e}")
 
+        if succeeded:
+            await update_scheduler_status(analyzed=True)
         logger.info("===== LLM 분석 배치 완료: %d건 중 %d건 성공 =====", total_count, succeeded)
         return total_count, succeeded
 
 
 # ── 루프 ──────────────────────────────────────────────────────
+async def heartbeat_loop(mode: str):
+    """스케줄러가 살아 있음을 주기적으로 DB에 기록. 종료(Ctrl+C) 시에는 중지 상태로 표시"""
+    try:
+        while True:
+            await update_scheduler_status(mode=mode, heartbeat=True)
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+    finally:
+        await update_scheduler_status(stopped=True)
+
+
 async def crawl_loop(manager: SecuritiesNewsCrawlerManager, interval_minutes: int):
     """외부 요청이므로 interval_minutes마다 한 번만 크롤링"""
     while True:
@@ -164,6 +182,16 @@ async def crawl_loop(manager: SecuritiesNewsCrawlerManager, interval_minutes: in
 
         logger.info("다음 크롤링까지 %d분 대기...", interval_minutes)
         await asyncio.sleep(interval_minutes * 60)
+
+
+async def reaction_loop():
+    """분석 끝난 기사의 발행 후 주가 반응을 주기적으로 계산 (5일이 지나야 확정되므로 계속 갱신)"""
+    while True:
+        try:
+            await update_price_reactions()
+        except Exception as e:
+            logger.error("주가 반응 계산 중 오류 발생: %s", e)
+        await asyncio.sleep(REACTION_INTERVAL_MINUTES * 60)
 
 
 async def analyze_loop(idle_minutes: int):
@@ -196,8 +224,10 @@ async def run_scheduler(interval_minutes: int, idle_minutes: int):
     )
 
     await asyncio.gather(
+        heartbeat_loop("full"),
         crawl_loop(manager, interval_minutes),
         analyze_loop(idle_minutes),
+        reaction_loop(),
     )
 
 
@@ -207,6 +237,7 @@ async def run_once():
     manager = SecuritiesNewsCrawlerManager(max_pages=1)
     await crawl_job(manager)
     await analyze_job()
+    await update_price_reactions()
 
 
 async def run_analyze_only(idle_minutes: int, once: bool):
@@ -215,7 +246,7 @@ async def run_analyze_only(idle_minutes: int, once: bool):
 
     if not once:
         logger.info("분석 전용 모드 시작 — 크롤링 없이 대기 기사를 계속 분석합니다. (Ctrl+C로 종료)")
-        await analyze_loop(idle_minutes)
+        await asyncio.gather(heartbeat_loop("analyze-only"), analyze_loop(idle_minutes), reaction_loop())
         return
 
     # --once: 밀린 기사를 모두 분석하고 종료
@@ -230,6 +261,7 @@ async def run_analyze_only(idle_minutes: int, once: bool):
         if succeeded == 0:
             logger.warning("이번 배치가 모두 실패해 중단합니다(Ollama 실행 여부 확인).")
             break
+    await update_price_reactions()
     logger.info("분석 전용 모드 종료 — 총 %d건 처리, %d건 성공", total_processed, total_succeeded)
 
 

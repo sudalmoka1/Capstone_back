@@ -21,6 +21,18 @@ SYSTEM_PROMPT = (
 # (한국 기사의 '美', '中', '銀' 같은 한 글자 한자는 허용)
 HAN_RUN_RE = re.compile(r"[一-鿿]{2,}")
 
+# 과장 문구 검증 시 비교에서 무시할 문자 (공백, 각종 따옴표, 말줄임표 등 표기 차이)
+PHRASE_NOISE_RE = re.compile(r"[\s'\"‘’“”`·….]+")
+MAX_PHRASE_LEN = 40  # 이보다 긴 '문구'는 문장 통째 인용이라 과장 표현으로 보지 않음
+
+# 숫자가 들어간 문구는 대부분 수치 전달("3% 올랐다")이라 과장이 아님.
+# 7B 모델이 프롬프트 규칙을 자주 어기므로, 숫자 문구는 아래 자극적 표현이 함께 있을 때만 과장으로 인정한다.
+HAS_DIGIT_RE = re.compile(r"\d")
+HYPE_WORDS = (
+    "폭등", "불기둥", "잭팟", "역대급", "터진", "터질", "들썩", "싹쓸이", "대박", "확실", "무조건", "반드시",
+    "훨훨", "껑충", "치솟", "수직", "폭발", "광풍", "열풍", "텐배거", "신화", "슈퍼사이클",
+)
+
 
 class LLMAnalyzer:
     def __init__(self, model_name="qwen2.5:7b"):
@@ -79,7 +91,7 @@ class LLMAnalyzer:
             logger.warning(f"데이터 수집 오류 ({ticker}): {e}")
             return None
 
-    def build_prompt(self, text: str, stock_data: dict = None) -> str:
+    def build_prompt(self, text: str, stock_data: dict = None, title: str = None) -> str:
         if stock_data:
             market_context = (
                 "[실제 시장 데이터]\n"
@@ -95,12 +107,23 @@ class LLMAnalyzer:
 {market_context}
 
 [분석 대상 기사]
+제목: {title or "(제목 없음)"}
 \"\"\"
 {text}
 \"\"\"
 
+[과장 표현 찾기] 투자자의 기대감을 과도하게 부추기는 표현을 제목과 본문에서 찾아 그대로 인용합니다.
+- 자극적 수식어: 폭등, 불기둥, 잭팟, 역대급, 터진다, 들썩, 싹쓸이, 대박 등
+- 근거 없는 단정적 전망: "반드시 오른다", "확실시", "더 크게 터진다"
+- 일부 수치나 일회성 사건을 과대 해석해 장밋빛 전망만 강조하는 표현
+- 제목이 본문 내용보다 훨씬 자극적인 경우의 제목 속 표현
+다음은 과장이 아닙니다.
+- 실적·주가 등락률·목표가 같은 수치를 그대로 전한 문장 (예: "3% 올랐다", "영업이익 42% 상향")
+- 공시, 사실 전달, 출처가 분명한 전문가·증권사 인용
+인용은 짧은 표현 단위(몇 단어)로 하고, 기사에 없는 말을 지어내지 않습니다. 없으면 빈 배열입니다.
+
 [평가 기준] 각 항목을 true 또는 false로 판단합니다.
-1. exaggeration: 실제 지표(목표가, PER 등) 대비 주장이 지나치게 낙관적이면 true
+1. exaggeration: 위에서 찾은 과장 표현이 하나라도 있으면 true
 2. investment_basis: 구체적인 수치나 논리적 근거가 있으면 true
 3. data_based: {data_rule} 판단해 부합하면 true
 4. risk_explanation: 손실 가능성이나 하락 요인을 구체적으로 언급하면 true
@@ -112,6 +135,7 @@ class LLMAnalyzer:
 
 아래 JSON 형식으로만 답하세요.
 {{
+  "exaggeration_phrases": ["기사에서 그대로 인용한 과장 표현", ...],
   "exaggeration": true 또는 false,
   "investment_basis": true 또는 false,
   "data_based": true 또는 false,
@@ -152,6 +176,34 @@ class LLMAnalyzer:
                 logger.error(f"파싱 오류: {e}")
                 return None
 
+    def verify_exaggeration(self, result: dict, source: str) -> dict:
+        """
+        LLM이 뽑은 과장 문구가 실제 기사(제목+본문)에 있는지 확인해 지어낸 문구를 버리고,
+        남은 문구가 있을 때만 exaggeration=true로 확정한다.
+        """
+        phrases = result.get("exaggeration_phrases")
+        if not isinstance(phrases, list):
+            phrases = []
+
+        normalized_source = PHRASE_NOISE_RE.sub("", source or "")
+        verified, dropped = [], []
+        for p in phrases:
+            if not isinstance(p, str):
+                continue
+            p = re.sub(r"['\"‘’“”]", "", p).strip()  # 저장·표시용으로 따옴표 제거 (예: '100조' 역대급 → 100조 역대급)
+            key = PHRASE_NOISE_RE.sub("", p)
+            numeric_fact = HAS_DIGIT_RE.search(p) and not any(w in p for w in HYPE_WORDS)
+            if key and len(p) <= MAX_PHRASE_LEN and key in normalized_source and not numeric_fact and p not in verified:
+                verified.append(p)
+            elif p:
+                dropped.append(p)
+
+        if dropped:
+            logger.info("과장 문구에서 제외 (기사에 없음 / 너무 긺 / 단순 수치): %s", dropped)
+        result["exaggeration_phrases"] = verified
+        result["exaggeration"] = bool(verified)
+        return result
+
     def calculate_score(self, result: dict) -> int:
         score = 100
         if result.get("exaggeration"):
@@ -164,13 +216,13 @@ class LLMAnalyzer:
             score -= 25
         return max(score, 0)
 
-    def analyze(self, ticker: str, text: str, stock_name: str = None):
+    def analyze(self, ticker: str, text: str, stock_name: str = None, title: str = None):
         stock_data = self.get_stock_data_cached(ticker)
         # 야후 종목명은 영어(예: Samsung Electronics)라 요약에 영어가 섞이므로 한국어 종목명으로 교체
         if stock_data and stock_name:
             stock_data = {**stock_data, "종목명": stock_name}
         clean_text = self.preprocess(text)
-        prompt = self.build_prompt(clean_text, stock_data)
+        prompt = self.build_prompt(clean_text, stock_data, title)
 
         raw_response = self.call_llm(prompt)
         if not raw_response:
@@ -188,6 +240,8 @@ class LLMAnalyzer:
                 result = retry_result
 
         if result:
+            # LLM이 보고 판단한 범위(제목 + 잘린 본문) 안에서 과장 문구를 검증
+            result = self.verify_exaggeration(result, f"{title or ''}\n{clean_text}")
             result["ticker"] = ticker
             result["score"] = self.calculate_score(result)
             return result

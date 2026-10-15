@@ -1,8 +1,8 @@
 import os
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
-from sqlalchemy import String, Text, DateTime, ForeignKey, Integer, select, text
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -81,6 +81,61 @@ class ArticleStockModel(Base):
     article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
     stock_code: Mapped[str] = mapped_column(ForeignKey("stocks.stock_code", ondelete="CASCADE"), primary_key=True)
     rank: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # 0 = 대표 종목, 1, 2 ... 순
+
+
+# 4-1. 기사 발행 후 실제 주가 반응 (AI 점수 검증용, price_reaction.py가 계산)
+class ArticlePriceReactionModel(Base):
+    __tablename__ = "article_price_reactions"
+
+    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), primary_key=True)
+    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)   # 계산에 쓴 대표 종목
+    base_date: Mapped[date] = mapped_column(Date, nullable=False)         # 기준가(기사 직전 종가) 날짜
+    # 수익률은 % 단위. 아직 해당 거래일이 지나지 않았으면 NULL → 다음 계산 때 채움
+    ret_1d: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ret_5d: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    excess_1d: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 시장지수 대비 초과 수익률 (%p)
+    excess_5d: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# 5. 스케줄러 상태 (한 행만 사용, id=1) — 별도 프로세스인 scheduler.py가 주기적으로 갱신
+class SchedulerStatusModel(Base):
+    __tablename__ = "scheduler_status"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    mode: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # full / analyze-only
+    # 시각은 DB의 now()로 기록 → API에서도 DB 기준으로 경과 시간을 계산해 시계/시간대 차이 문제를 피함
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_crawl_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_analyze_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+async def update_scheduler_status(
+    *, mode: Optional[str] = None, heartbeat: bool = False, crawled: bool = False,
+    analyzed: bool = False, stopped: bool = False,
+) -> None:
+    """스케줄러 상태 행을 갱신합니다. 상태 기록 실패가 스케줄러를 멈추지 않도록 예외는 로그만 남깁니다."""
+    values = {}
+    if mode is not None:
+        values["mode"] = mode
+    if heartbeat:
+        values["heartbeat_at"] = func.now()
+    if stopped:
+        values["heartbeat_at"] = None
+    if crawled:
+        values["last_crawl_at"] = func.now()
+    if analyzed:
+        values["last_analyze_at"] = func.now()
+    if not values:
+        return
+    try:
+        async with AsyncSessionLocal() as session:
+            stmt = pg_insert(SchedulerStatusModel).values(id=1, **values)
+            stmt = stmt.on_conflict_do_update(index_elements=[SchedulerStatusModel.id], set_=values)
+            await session.execute(stmt)
+            await session.commit()
+    except Exception as e:
+        logger.warning("스케줄러 상태 기록 실패: %s", e)
 
 
 # 데이터베이스 초기화 함수 (main.py의 lifespan에서 호출됨)
