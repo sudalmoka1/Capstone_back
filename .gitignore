@@ -219,3 +219,6 @@ __marimo__/
 
 # 크롤링 결과 (원문 데이터는 저장소에 올리지 않음)
 crawl_result.json
+
+# 라벨링 평가 데이터 (기사 본문이 들어 있어 저장소에 올리지 않음)
+evaluation/data/
