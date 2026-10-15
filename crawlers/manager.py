@@ -21,6 +21,7 @@ from crawlers.news_crawler import (
     Press,
     fetch_article_detail,
 )
+from crawlers.article_filter import exclusion_reason
 from crawlers.stock_matcher import StockMatcher
 
 logger = logging.getLogger(__name__)
@@ -91,10 +92,16 @@ class SecuritiesNewsCrawlerManager:
             # 기사별 언급 종목 연결 (stocks 테이블 기준)
             try:
                 await self.matcher.load()
+                excluded = 0
                 for a in unique:
+                    # 부고·포토 등 주식과 무관한 기사는 종목을 연결하지 않음 → 목록·분석 대상에서 빠짐
+                    if exclusion_reason(a.title, a.content):
+                        a.related_stocks = []
+                        excluded += 1
+                        continue
                     a.related_stocks = self.matcher.match(a.title, a.content)
                 matched = sum(1 for a in unique if a.related_stocks)
-                logger.info("종목 매칭 | %d건 중 %d건에서 종목 발견", len(unique), matched)
+                logger.info("종목 매칭 | %d건 중 %d건에서 종목 발견 (주식 무관 %d건 제외)", len(unique), matched, excluded)
             except Exception as e:
                 logger.error("종목 매칭 실패(종목 없이 진행): %s", e)
 

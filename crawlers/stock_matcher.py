@@ -121,6 +121,7 @@ class StockMatcher:
 async def backfill() -> tuple[int, int]:
     """DB에 이미 저장된 기사에 종목을 연결합니다. (처리한 기사 수, 연결 수)"""
     from api.storage import ArticleModel, ArticleStockModel, AsyncSessionLocal
+    from crawlers.article_filter import exclusion_reason
 
     matcher = StockMatcher()
     await matcher.load()
@@ -132,6 +133,8 @@ async def backfill() -> tuple[int, int]:
                 select(ArticleModel.id, ArticleModel.title, ArticleModel.content)
             )).all()
             for art_id, title, content in rows:
+                if exclusion_reason(title, content):  # 주식 무관 기사는 다시 연결하지 않음
+                    continue
                 for rank, code in enumerate(matcher.match(title, content)):
                     stmt = pg_insert(ArticleStockModel).values(article_id=art_id, stock_code=code, rank=rank)
                     await session.execute(stmt.on_conflict_do_update(

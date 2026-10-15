@@ -519,6 +519,8 @@ async def get_reaction_summary(
             .join(ArticleModel, ArticleModel.id == ArticlePriceReactionModel.article_id)
             .where(ArticleEvaluationModel.status == "COMPLETED")
             .where(ArticleModel.published_at >= since)
+            # 종목 연결이 끊긴 기사(주식 무관으로 제외된 기사)는 집계에서 뺌
+            .where(ArticleModel.id.in_(select(ArticleStockModel.article_id)))
         )
         rows = []
         for reaction, score, report in result.all():
