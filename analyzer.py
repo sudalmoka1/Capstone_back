@@ -25,13 +25,47 @@ HAN_RUN_RE = re.compile(r"[一-鿿]{2,}")
 PHRASE_NOISE_RE = re.compile(r"[\s'\"‘’“”`·….]+")
 MAX_PHRASE_LEN = 40  # 이보다 긴 '문구'는 문장 통째 인용이라 과장 표현으로 보지 않음
 
-# 숫자가 들어간 문구는 대부분 수치 전달("3% 올랐다")이라 과장이 아님.
-# 7B 모델이 프롬프트 규칙을 자주 어기므로, 숫자 문구는 아래 자극적 표현이 함께 있을 때만 과장으로 인정한다.
-HAS_DIGIT_RE = re.compile(r"\d")
-HYPE_WORDS = (
-    "폭등", "불기둥", "잭팟", "역대급", "터진", "터질", "들썩", "싹쓸이", "대박", "확실", "무조건", "반드시",
-    "훨훨", "껑충", "치솟", "수직", "폭발", "광풍", "열풍", "텐배거", "신화", "슈퍼사이클",
+# 증권 기사에서 기대감·공포감을 부추기는 자극적 표현 사전.
+# 7B 모델은 프롬프트에 예시를 넣어도 과장을 대부분 놓쳐서(사람 대비 κ 0.29), 사전으로 직접 찾아 보완한다.
+# 일반 시세 표현(상승, 하락, 급등, 급락)은 넣지 않는다.
+HYPE_PATTERNS = (
+    # 기대감
+    r"폭등", r"불기둥", r"잭팟", r"역대급", r"터진다", r"터졌다", r"터질", r"들썩", r"싹쓸이", r"초?대박", r"훨훨",
+    r"껑충", r"치솟", r"수직\s?상승", r"폭발(?!\s?사고)", r"광풍", r"열풍", r"텐배거", r"떡상", r"고공행진", r"축포",
+    r"불장", r"쓸어\s?담", r"줍줍", r"슈퍼\s?사이클", r"승부수", r"통\s?큰", r"꿈의",
+    # 근거 없는 단정
+    r"반드시", r"무조건", r"(?<!불)확실시",
+    # 공포감
+    r"폭락", r"증발", r"휘청", r"풀썩", r"털썩", r"와르르", r"패닉", r"공포(?!\s?(지수|탐욕))", r"쇼크", r"곤두박질",
+    r"추풍낙엽", r"날벼락", r"직격탄", r"쑥대밭", r"초토화", r"피눈물", r"비명", r"악몽", r"아비규환",
+    r"검은\s?[월화수목금토일]요일", r"블랙\s?(먼데이|스완)",
 )
+HYPE_RE = re.compile("|".join(f"(?:{p})" for p in HYPE_PATTERNS))
+
+# 숫자가 들어간 문구는 대부분 수치 전달("3% 올랐다")이라 과장이 아님.
+# 7B 모델이 프롬프트 규칙을 자주 어기므로, 숫자 문구는 위 자극적 표현이 함께 있을 때만 과장으로 인정한다.
+HAS_DIGIT_RE = re.compile(r"\d")
+
+
+def find_hype_phrases(title: str, text: str = "", scope: str = "title") -> list[str]:
+    """
+    사전에 있는 자극적 표현을 찾아 '앞 단어 + 걸린 단어'로 반환 (scope: "title" = 제목만, "all" = 제목 + 본문)
+    예: "증시 '휘청'에 시총 389조원 '증발'" → ["증시 휘청에", "389조원 증발"]
+    """
+    sources = [title or ""] + ([text or ""] if scope == "all" else [])
+    found: list[str] = []
+    for src in sources:
+        # 문장 전체에서 찾아야 "폭발 사고"처럼 뒤 단어를 보는 예외가 동작함
+        clean = " ".join(re.sub(r"[…·]", " ", re.sub(r"['\"‘’“”]", "", src)).split())
+        for m in HYPE_RE.finditer(clean):
+            end = clean.find(" ", m.end())
+            end = len(clean) if end == -1 else end
+            word_start = clean.rfind(" ", 0, m.start()) + 1
+            prev_start = clean.rfind(" ", 0, max(0, word_start - 1)) + 1 if word_start > 0 else word_start
+            phrase = " ".join(clean[prev_start:end].split())
+            if phrase and phrase not in found:
+                found.append(phrase)
+    return found
 
 
 class LLMAnalyzer:
@@ -192,7 +226,7 @@ class LLMAnalyzer:
                 continue
             p = re.sub(r"['\"‘’“”]", "", p).strip()  # 저장·표시용으로 따옴표 제거 (예: '100조' 역대급 → 100조 역대급)
             key = PHRASE_NOISE_RE.sub("", p)
-            numeric_fact = HAS_DIGIT_RE.search(p) and not any(w in p for w in HYPE_WORDS)
+            numeric_fact = HAS_DIGIT_RE.search(p) and not HYPE_RE.search(p)
             if key and len(p) <= MAX_PHRASE_LEN and key in normalized_source and not numeric_fact and p not in verified:
                 verified.append(p)
             elif p:
@@ -202,6 +236,19 @@ class LLMAnalyzer:
             logger.info("과장 문구에서 제외 (기사에 없음 / 너무 긺 / 단순 수치): %s", dropped)
         result["exaggeration_phrases"] = verified
         result["exaggeration"] = bool(verified)
+        return result
+
+    def apply_hype_rule(self, result: dict, title: str) -> dict:
+        """
+        LLM이 놓친 과장을 사전으로 보완: 제목에 자극적 표현이 있으면 과장으로 판정.
+        (검증: 사람 라벨 대비 과장 κ가 개발용 100건 0.29→0.58, 새 기사 50건 0.00→0.25. 본문까지 보면 인용문 오탐이 생겨 제목만 봄)
+        """
+        hits = find_hype_phrases(title, scope="title")
+        phrases = result.get("exaggeration_phrases") or []
+        # LLM이 이미 뽑은 문구와 겹치면("역대급" / "매수 역대급") 한 번만 표시
+        result["exaggeration_phrases"] = phrases + [h for h in hits if not any(p in h or h in p for p in phrases)]
+        result["exaggeration_rule"] = hits  # 어떤 표현이 사전으로 잡혔는지 (LLM 판정과 구분용)
+        result["exaggeration"] = bool(result["exaggeration_phrases"])
         return result
 
     def calculate_score(self, result: dict) -> int:
@@ -242,6 +289,7 @@ class LLMAnalyzer:
         if result:
             # LLM이 보고 판단한 범위(제목 + 잘린 본문) 안에서 과장 문구를 검증
             result = self.verify_exaggeration(result, f"{title or ''}\n{clean_text}")
+            result = self.apply_hype_rule(result, title)
             result["ticker"] = ticker
             result["score"] = self.calculate_score(result)
             return result
