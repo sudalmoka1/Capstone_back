@@ -162,7 +162,9 @@ async def get_db_articles(
             select(ArticleModel, ArticleEvaluationModel, PublisherModel.name)
             .outerjoin(ArticleEvaluationModel, ArticleModel.id == ArticleEvaluationModel.article_id)
             .outerjoin(PublisherModel, ArticleModel.publisher_id == PublisherModel.id)
-            .order_by(ArticleModel.id.desc())
+            # 발행 시각 최신순 (id는 저장 순서라 한 번에 수집된 기사끼리는 순서가 뒤집힘)
+            # 시각이 같으면 id로 순서를 고정해 페이지네이션 결과가 흔들리지 않게 함
+            .order_by(ArticleModel.published_at.desc().nulls_last(), ArticleModel.id.desc())
         )
 
         if source and source != "전체":
