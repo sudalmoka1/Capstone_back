@@ -189,7 +189,8 @@ class LLMAnalyzer:
             "options": {"temperature": 0.2},  # 낮을수록 언어/형식이 흔들리지 않음
         }
         try:
-            response = requests.post(self.ollama_url, json=payload, timeout=120)
+            # CPU 전용 서버(AWS)에서는 기사 1건에 4~6분 걸리므로 넉넉하게 대기 (시간 초과 시 Ollama도 작업을 버림)
+            response = requests.post(self.ollama_url, json=payload, timeout=600)
             response.raise_for_status()
             return response.json().get("response")
         except Exception as e:
