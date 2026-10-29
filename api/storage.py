@@ -143,9 +143,20 @@ async def init_db():
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # create_all은 기존 테이블에 컬럼을 추가하지 않으므로 market 컬럼을 직접 보강
-            await conn.execute(text("ALTER TABLE stocks ADD COLUMN IF NOT EXISTS market VARCHAR(10)"))
-            await conn.execute(text("ALTER TABLE article_stocks ADD COLUMN IF NOT EXISTS rank INTEGER NOT NULL DEFAULT 0"))
+            # create_all은 기존 테이블에 컬럼을 추가하지 않으므로 market/rank 컬럼을 직접 보강
+            # ALTER TABLE은 IF NOT EXISTS여도 테이블 잠금을 잡아서, 스케줄러가 분석 중이면 서버 시작이 멈춤
+            # → 컬럼이 실제로 없을 때만 실행
+            existing = {
+                (t, c) for t, c in (await conn.execute(text(
+                    "SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND (table_name, column_name) IN (('stocks', 'market'), ('article_stocks', 'rank'))"
+                ))).all()
+            }
+            if ("stocks", "market") not in existing:
+                await conn.execute(text("ALTER TABLE stocks ADD COLUMN IF NOT EXISTS market VARCHAR(10)"))
+            if ("article_stocks", "rank") not in existing:
+                await conn.execute(text("ALTER TABLE article_stocks ADD COLUMN IF NOT EXISTS rank INTEGER NOT NULL DEFAULT 0"))
         logger.info("PostgreSQL 테이블 모델 연결 성공")
     except Exception as e:
         logger.error("PostgreSQL 초기화 실패: %s", e)
