@@ -285,6 +285,86 @@ async def get_publishers():
     return [PublisherOut(name=n, count=counts.get(n, 0)) for n in names]
 
 
+# ── 언론사별 기사 신뢰도 ──────────────────────────────────────
+# 기사 수가 적은 언론사는 평균이 우연에 크게 흔들리므로 순위에서 제외
+PUBLISHER_MIN_ARTICLES = 30
+
+
+class PublisherStatOut(BaseModel):
+    rank: Optional[int]                 # 순위 (기사 수 부족이면 None)
+    name: str
+    analyzed: int                       # 분석 완료 기사 수
+    avg_score: float                    # 평균 신뢰도
+    exaggeration_pct: float             # 과장 표현 감지 비율 (%)
+    basis_pct: float                    # 구체적 투자 근거 제시 비율 (%)
+    data_pct: float                     # 시장 데이터 부합 비율 (%)
+    risk_pct: float                     # 리스크 언급 비율 (%)
+
+
+class PublisherRankingOut(BaseModel):
+    days: int
+    min_articles: int
+    ranked: list[PublisherStatOut]      # 기사 수 충분, 평균 신뢰도 순
+    insufficient: list[PublisherStatOut]  # 기사 수 부족 (순위 없음, 기사 수 순)
+
+
+@router.get("/publishers/ranking", response_model=PublisherRankingOut)
+async def get_publisher_ranking(
+    days: int = Query(default=90, ge=1, le=365, description="최근 N일 발행 기사 기준"),
+):
+    """
+    언론사별 AI 판정 집계 (분석 완료된 주식 기사 기준)
+    - 순위는 참고용이며 기사 점수에는 반영하지 않음
+    """
+    since = datetime.now() - timedelta(days=days)
+    article_time = func.coalesce(ArticleModel.published_at, ArticleModel.created_at)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(PublisherModel.name, ArticleEvaluationModel.score, ArticleEvaluationModel.report)
+            .join(ArticleModel, ArticleModel.publisher_id == PublisherModel.id)
+            .join(ArticleEvaluationModel, ArticleEvaluationModel.article_id == ArticleModel.id)
+            .where(ArticleEvaluationModel.status == "COMPLETED")
+            .where(article_time >= since)
+            .where(ArticleModel.id.in_(select(ArticleStockModel.article_id)))  # 주식 뉴스만 집계
+        )
+        by_publisher: dict[str, list[tuple[int, dict]]] = {}
+        for name, score, report in result.all():
+            try:
+                parsed = json.loads(report) if isinstance(report, str) else (report or {})
+            except Exception:
+                parsed = {}
+            by_publisher.setdefault(name, []).append((score or 0, parsed))
+
+    def pct(items: list[tuple[int, dict]], key: str) -> float:
+        return round(sum(1 for _, r in items if r.get(key)) / len(items) * 100, 1)
+
+    stats = [
+        PublisherStatOut(
+            rank=None,
+            name=name,
+            analyzed=len(items),
+            avg_score=round(sum(s for s, _ in items) / len(items), 1),
+            exaggeration_pct=pct(items, "exaggeration"),
+            basis_pct=pct(items, "investment_basis"),
+            data_pct=pct(items, "data_based"),
+            risk_pct=pct(items, "risk_explanation"),
+        )
+        for name, items in by_publisher.items()
+    ]
+
+    ranked = sorted(
+        (s for s in stats if s.analyzed >= PUBLISHER_MIN_ARTICLES),
+        key=lambda s: (-s.avg_score, -s.analyzed, s.name),
+    )
+    for i, s in enumerate(ranked, 1):
+        s.rank = i
+    insufficient = sorted(
+        (s for s in stats if s.analyzed < PUBLISHER_MIN_ARTICLES),
+        key=lambda s: (-s.analyzed, s.name),
+    )
+    return PublisherRankingOut(days=days, min_articles=PUBLISHER_MIN_ARTICLES, ranked=ranked, insufficient=insufficient)
+
+
 @router.get("/stocks/ranking", response_model=list[StockRankingOut])
 async def get_stock_ranking(
     days: int = Query(default=7, ge=1, le=90, description="최근 N일 기사 기준"),
